@@ -10,15 +10,19 @@ foreach ($port in $ports) {
     foreach ($conn in $connections) {
         $procId = $conn.OwningProcess
         if ($procId -gt 0) {
-            Write-Host "Stopping process (PID: $procId) on port $port..." -ForegroundColor Yellow
+            Write-Host "Stopping microservice process (PID: $procId) on port $port..." -ForegroundColor Yellow
             Stop-Process -Id $procId -Force
         }
     }
 }
 
-# 2. Stop Docker containers
+# 2. Stop Ollama background processes
+Write-Host "Stopping Ollama server..." -ForegroundColor Yellow
+Get-Process -Name "ollama", "ollama app" | Stop-Process -Force
+
+# 3. Stop Docker containers (leave Docker Desktop engine intact)
 Write-Host "Stopping Docker containers..." -ForegroundColor Yellow
 Set-Location $RootDir
 docker compose down
 
-Write-Host "=== All services and containers stopped! ===" -ForegroundColor Green
+Write-Host "=== All services, Ollama, and containers stopped! ===" -ForegroundColor Green
