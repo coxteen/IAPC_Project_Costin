@@ -4,6 +4,7 @@ import com.photopulse.ingestion.model.ManualDocument;
 import com.photopulse.ingestion.repository.ManualDocumentRepository;
 import com.photopulse.ingestion.service.DocumentIngestionService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -13,12 +14,14 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.IOException;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/v1/ingestion")
 @RequiredArgsConstructor
+@Slf4j
 public class IngestionController {
 
     private final DocumentIngestionService ingestionService;
@@ -31,7 +34,8 @@ public class IngestionController {
             @RequestParam("file") MultipartFile file,
             @RequestParam("cameraModel") String cameraModel,
             @RequestParam("brand") String brand,
-            @RequestParam(value = "tenantId", defaultValue = "default-tenant") String tenantId
+            @RequestParam(value = "tenantId", defaultValue = "default-tenant") String tenantId,
+            @RequestParam(value = "version", defaultValue = "1.0") String version
     ) throws IOException {
 
         if (file.isEmpty() || file.getOriginalFilename() == null) {
@@ -47,7 +51,24 @@ public class IngestionController {
             return ResponseEntity.badRequest().body("Unsupported file format. Allowed: PDF, DOCX, TXT.");
         }
 
+        byte[] fileBytes = file.getBytes();
+        String checksum = ingestionService.computeSha256(fileBytes);
+        String docId = ingestionService.generateStableDocId(originalName, cameraModel, tenantId);
+
+        // Idempotenta: daca acelasi fisier (acelasi SHA-256) a fost deja ingerat cu succes, nu cream duplicate
+        Optional<ManualDocument> existing = documentRepository
+                .findFirstByChecksumAndTenantIdAndCameraModelAndStatus(
+                        checksum, tenantId, cameraModel, ManualDocument.IngestionStatus.COMPLETED);
+
+        if (existing.isPresent()) {
+            log.info("Duplicate file detected (docId={}, checksum={}). Skipping re-ingestion.", docId, checksum);
+            return ResponseEntity.ok(existing.get());
+        }
+
         ManualDocument savedDoc = documentRepository.save(ManualDocument.builder()
+                .docId(docId)
+                .checksum(checksum)
+                .version(version)
                 .fileName(originalName)
                 .cameraModel(cameraModel)
                 .brand(brand)
@@ -56,8 +77,9 @@ public class IngestionController {
                 .uploadedAt(LocalDateTime.now())
                 .build());
 
-        byte[] fileBytes = file.getBytes();
-        ingestionService.processDocumentAsync(savedDoc.getId(), fileBytes, originalName, cameraModel, brand, tenantId);
+        ingestionService.processDocumentAsync(
+                savedDoc.getId(), fileBytes, originalName, docId, version, checksum, cameraModel, brand, tenantId
+        );
 
         return ResponseEntity.status(HttpStatus.ACCEPTED).body(savedDoc);
     }

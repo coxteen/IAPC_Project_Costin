@@ -6,7 +6,7 @@ spring:
     name: ingestion-service
   threads:
     virtual:
-      enabled: true # Java Virtual Threads for parralel processing of the PDFs
+      enabled: true
   servlet:
     multipart:
       max-file-size: 50MB
@@ -25,13 +25,22 @@ spring:
       base-url: http://localhost:11434
       embedding:
         options:
-          model: nomic-embed-text
+          model: ${APP_EMBEDDING_MODEL:nomic-embed-text}
     vectorstore:
       qdrant:
         host: localhost
-        port: 6334 # gRPC port for Qdrant
+        port: 6334
         collection-name: camera_manuals
-        initialize-schema: true # Automatically create the collection in Qdrant on startup
+        initialize-schema: true
+
+app:
+  ingestion:
+    chunk-size: ${APP_CHUNK_SIZE:250}
+    chunk-overlap: ${APP_CHUNK_OVERLAP:50}
+    parent-chunk-size: ${APP_PARENT_CHUNK_SIZE:1000}
+    min-chunk-size-chars: ${APP_MIN_CHUNK_SIZE_CHARS:80}
+    embedding-model: ${APP_EMBEDDING_MODEL:nomic-embed-text}
+    batch-size: ${APP_INGESTION_BATCH_SIZE:20}
 
 eureka:
   client:
