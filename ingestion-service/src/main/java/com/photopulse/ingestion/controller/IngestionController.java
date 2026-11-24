@@ -11,6 +11,10 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
+import com.photopulse.ingestion.dto.DynamicIngestionDtos.*;
+import com.photopulse.ingestion.service.DynamicInternetIngestionService;
+import jakarta.validation.Valid;
+
 import java.io.IOException;
 import java.time.LocalDateTime;
 import java.util.List;
@@ -26,6 +30,7 @@ public class IngestionController {
 
     private final DocumentIngestionService ingestionService;
     private final ManualDocumentRepository documentRepository;
+    private final DynamicInternetIngestionService dynamicIngestionService;
 
     private static final Set<String> ALLOWED_EXTENSIONS = Set.of("pdf", "docx", "txt");
 
@@ -95,5 +100,14 @@ public class IngestionController {
         return documentRepository.findById(id)
                 .map(ResponseEntity::ok)
                 .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PostMapping("/internet")
+    public ResponseEntity<DynamicBatchResponse> ingestFromInternet(
+            @Valid @RequestBody DynamicBatchRequest request) {
+        log.info("Received dynamic internet ingestion batch with {} sources for tenant={}",
+                request.sources().size(), request.resolvedTenantId());
+        DynamicBatchResponse response = dynamicIngestionService.ingestBatch(request);
+        return ResponseEntity.ok(response);
     }
 }

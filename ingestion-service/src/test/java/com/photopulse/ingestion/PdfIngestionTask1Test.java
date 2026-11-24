@@ -22,6 +22,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mock.web.MockMultipartFile;
 
+import com.photopulse.ingestion.service.DynamicInternetIngestionService;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -56,7 +58,8 @@ class PdfIngestionTask1Test {
         properties.setBatchSize(10);
 
         ingestionService = new DocumentIngestionService(vectorStore, documentRepository, chunker, properties);
-        ingestionController = new IngestionController(ingestionService, documentRepository);
+        DynamicInternetIngestionService dynamicIngestionService = mock(DynamicInternetIngestionService.class);
+        ingestionController = new IngestionController(ingestionService, documentRepository, dynamicIngestionService);
     }
 
     /**
