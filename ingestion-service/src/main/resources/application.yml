@@ -41,6 +41,11 @@ app:
     min-chunk-size-chars: ${APP_MIN_CHUNK_SIZE_CHARS:80}
     embedding-model: ${APP_EMBEDDING_MODEL:nomic-embed-text}
     batch-size: ${APP_INGESTION_BATCH_SIZE:20}
+  dynamic-ingestion:
+    connect-timeout-ms: ${APP_DYNAMIC_CONNECT_TIMEOUT_MS:10000}
+    read-timeout-ms: ${APP_DYNAMIC_READ_TIMEOUT_MS:15000}
+    max-repo-files: ${APP_DYNAMIC_MAX_REPO_FILES:15}
+    user-agent: "PhotoPulse-IngestionBot/1.0"
 
 eureka:
   client:
