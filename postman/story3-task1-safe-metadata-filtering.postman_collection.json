@@ -1,0 +1,157 @@
+{
+  "info": {
+    "name": "PhotoPulse AI - Story 3 Task 1: Safe Metadata Filtering",
+    "_postman_id": "a7f3c910-3b21-4d8e-9a11-77e812340001",
+    "description": "Demonstrates URL-parameter safe metadata filtering with whitelisted fields/operators, compound AND/OR expressions, null-filter fallthrough, and explicit 400 Bad Request errors.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost"
+    },
+    {
+      "key": "token",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Simple Single-Field Filter (GET with URL param)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/assistant/ask?question=How%20do%20I%20load%20film%3F&tenantId=studio-brasov&filter=brand%3Aeq%3AFujifilm",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "assistant", "ask"],
+          "query": [
+            { "key": "question", "value": "How do I load film?" },
+            { "key": "tenantId", "value": "studio-brasov" },
+            { "key": "filter", "value": "brand:eq:Fujifilm" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "2. Compound Multi-Variable Filter (AND + OR + IN)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/assistant/ask?question=How%20do%20I%20configure%20autofocus%3F&tenantId=studio-brasov&filter=(brand%3Aeq%3ASony%20OR%20brand%3Aeq%3AFujifilm)%20AND%20version%3Ain%3A(1.0%2C2.0)%20AND%20source_type%3Ane%3Aweb_page",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "assistant", "ask"],
+          "query": [
+            { "key": "question", "value": "How do I configure autofocus?" },
+            { "key": "tenantId", "value": "studio-brasov" },
+            { "key": "filter", "value": "(brand:eq:Sony OR brand:eq:Fujifilm) AND version:in:(1.0,2.0) AND source_type:ne:web_page" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "3. POST /ask with URL Filter Parameter",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"question\": \"How do I set the ISO?\",\n  \"cameraModel\": \"Fujifilm GA645\",\n  \"tenantId\": \"studio-brasov\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/assistant/ask?filter=brand%3Aeq%3AFujifilm%20AND%20version%3Aeq%3A1.0",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "assistant", "ask"],
+          "query": [
+            { "key": "filter", "value": "brand:eq:Fujifilm AND version:eq:1.0" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "4. Null Filter Fallthrough (Standard Flow)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/assistant/ask?question=How%20do%20I%20load%20film%3F&tenantId=studio-brasov",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "assistant", "ask"],
+          "query": [
+            { "key": "question", "value": "How do I load film?" },
+            { "key": "tenantId", "value": "studio-brasov" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "5. Invalid Field Error (Expect 400 Bad Request + Valid Fields List)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/assistant/ask?question=How%20do%20I%20load%20film%3F&tenantId=studio-brasov&filter=secret_field%3Aeq%3Aabc",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "assistant", "ask"],
+          "query": [
+            { "key": "question", "value": "How do I load film?" },
+            { "key": "tenantId", "value": "studio-brasov" },
+            { "key": "filter", "value": "secret_field:eq:abc" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "6. Injection Attempt Blocked (Expect 400 Bad Request)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/v1/assistant/ask?question=How%20do%20I%20load%20film%3F&tenantId=studio-brasov&filter=brand%3Aeq%3A'Sony%3B%20DROP%20TABLE%20users--'",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "v1", "assistant", "ask"],
+          "query": [
+            { "key": "question", "value": "How do I load film?" },
+            { "key": "tenantId", "value": "studio-brasov" },
+            { "key": "filter", "value": "brand:eq:'Sony; DROP TABLE users--'" }
+          ]
+        }
+      }
+    }
+  ]
+}
