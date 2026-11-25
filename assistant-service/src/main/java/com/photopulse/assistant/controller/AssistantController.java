@@ -20,16 +20,6 @@ public class AssistantController {
     private final AuditLogRepository auditLogRepository;
 
     @PostMapping("/ask")
-    public ResponseEntity<AskResponse> ask(@Valid @RequestBody AskRequest request) {
-        return ResponseEntity.ok(assistantService.askQuestion(request));
-    }
-
-    @PostMapping("/gap-analysis")
-    public ResponseEntity<AskResponse> gapAnalysis(@Valid @RequestBody GapAnalysisRequest request) {
-        return ResponseEntity.ok(assistantService.performGapAnalysis(request));
-    }
-
-   @PostMapping("/ask")
     public ResponseEntity<AskResponse> ask(
             @RequestParam(value = "filter", required = false) String urlFilter,
             @Valid @RequestBody AskRequest request) {
@@ -51,5 +41,16 @@ public class AssistantController {
             @RequestParam(value = "filter", required = false) String filter) {
         AskRequest request = new AskRequest(question, cameraModel, tenantId, filter);
         return ResponseEntity.ok(assistantService.askQuestion(request));
+    }
+
+    @PostMapping("/gap-analysis")
+    public ResponseEntity<AskResponse> gapAnalysis(@Valid @RequestBody GapAnalysisRequest request) {
+        return ResponseEntity.ok(assistantService.performGapAnalysis(request));
+    }
+
+    @GetMapping("/audit-logs")
+    public ResponseEntity<List<AuditLog>> getAuditLogs(
+            @RequestParam(value = "tenantId", defaultValue = "default-tenant") String tenantId) {
+        return ResponseEntity.ok(auditLogRepository.findByTenantIdOrderByCreatedAtDesc(tenantId));
     }
 }

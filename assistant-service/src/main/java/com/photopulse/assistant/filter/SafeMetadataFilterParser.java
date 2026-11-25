@@ -106,7 +106,6 @@ public class SafeMetadataFilterParser {
         }
         cursor.consume();
 
-        // Suportam formatul compact "field:op:value" sau separat prin spatii "field op value"
         String rawIdent = fieldToken.value();
         String fieldName;
         String opRaw;
@@ -117,7 +116,7 @@ public class SafeMetadataFilterParser {
             fieldName = colonParts[0];
             opRaw = colonParts[1];
             if (colonParts.length == 3 && !colonParts[2].isEmpty()) {
-                inlineValue = colonParts[2];
+                inlineValue = stripWrappingQuotes(colonParts[2]);
             }
         } else {
             fieldName = rawIdent;
@@ -151,6 +150,14 @@ public class SafeMetadataFilterParser {
         String value = (inlineValue != null) ? inlineValue : parseSingleValue(cursor, fieldName);
         validateValue(value, fieldName);
         return new Condition(fieldName, operator, List.of(value));
+    }
+
+    private String stripWrappingQuotes(String val) {
+        if ((val.startsWith("'") && val.endsWith("'") && val.length() >= 2)
+                || (val.startsWith("\"") && val.endsWith("\"") && val.length() >= 2)) {
+            return val.substring(1, val.length() - 1);
+        }
+        return val;
     }
 
     private List<String> parseInValueList(TokenCursor cursor, String fieldName) {
@@ -232,9 +239,25 @@ public class SafeMetadataFilterParser {
                 tokens.add(new Token(TokenType.STRING, sb.toString()));
             } else {
                 int start = i;
-                while (i < n && !Character.isWhitespace(input.charAt(i))
-                        && input.charAt(i) != '(' && input.charAt(i) != ')' && input.charAt(i) != ',') {
-                    i++;
+                Character activeQuote = null;
+                while (i < n) {
+                    char ch = input.charAt(i);
+                    if (activeQuote != null) {
+                        i++;
+                        if (ch == activeQuote) {
+                            activeQuote = null;
+                        }
+                    } else if (ch == '\'' || ch == '"') {
+                        activeQuote = ch;
+                        i++;
+                    } else if (Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == ',') {
+                        break;
+                    } else {
+                        i++;
+                    }
+                }
+                if (activeQuote != null) {
+                    throw invalid("Unterminated quoted string in filter expression", String.valueOf(activeQuote));
                 }
                 String word = input.substring(start, i);
                 if ("AND".equalsIgnoreCase(word) || "&&".equals(word)) {
