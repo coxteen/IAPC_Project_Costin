@@ -1,26 +1,171 @@
-# Story 3 – Task 1: Safe Metadata Filtering
+# Story 3: Safe Metadata Filtering
 
-## 1. Overview
-Adds a strict, AST-backed metadata filter parser (`SafeMetadataFilterParser`) to `assistant-service` so that URL query parameters (`?filter=...`) are parsed, validated against a strict allowlist, and compiled into a typed Spring AI `Filter.Expression` before reaching Qdrant. Raw strings never reach the vector store.
+## The Problem
 
----
+The assistant normally builds a trusted filter internally:
 
-## 2. Whitelisted Fields & Operators
+```text
+tenant_id = current tenant
+AND camera_model = requested model
+```
 
-| Category | Allowed Values | Enforcement Behavior |
-| :--- | :--- | :--- |
-| **Metadata Fields** | `tenant_id`, `camera_model`, `brand`, `doc_id`, `version`, `source_type` | Any unknown field throws `InvalidMetadataFilterException` (`HTTP 400`) listing all valid fields. |
-| **Comparison Operators** | `eq` (`=`), `ne` (`!=`), `in` | Unsupported operators (e.g., `regex`, `like`) are rejected with `HTTP 400`. |
-| **Logical Combinators** | `AND`, `OR`, parentheses `(...)` | Supports nested compound expressions; `AND` binds tighter than `OR`. |
-| **Value Sanitization** | `^[a-zA-Z0-9_.:/@\- ]{1,128}$` | Rejects semicolons, quotes, and injection payloads before query expansion or vector search. |
+For advanced searches, a client may need additional conditions such as brand or document version. However, accepting and forwarding a raw Qdrant filter string is unsafe. It can expose implementation details or contain untrusted syntax.
 
----
+The solution is `SafeMetadataFilterParser`: parse the user expression, allow only known fields and operators, and compile it into a typed Spring AI expression.
 
-## 3. Endpoints & Fallthrough Behavior
+## Filter Grammar
 
-- **`GET /api/v1/assistant/ask?question=...&tenantId=...&filter=...`** and **`POST /api/v1/assistant/ask?filter=...`**
-- **Null / Blank Filter Fallthrough:** When `filter` is omitted or blank, the pipeline falls back to the standard tenant-isolated filter (`tenant_id == <tenantId>` and optional `camera_model == <cameraModel>`).
-- **Explicit `400 Bad Request` Error Payload:**
+```text
+condition := field operator value
+condition := field:operator:value
+expression := expression AND expression
+expression := expression OR expression
+expression := (expression)
+in-list   := field:in:(value1,value2)
+```
+
+Examples:
+
+```text
+brand:eq:Sony
+camera_model:eq:'Sony A7 IV'
+brand:eq:Sony AND version:eq:1.0
+brand:in:(Sony,Canon)
+source_type:ne:web_page
+brand:eq:Sony AND (camera_model:eq:'Sony A7 IV' OR version:in:(1.0,2.0))
+```
+
+## Allowed Fields and Operators
+
+| Category | Allowed values |
+|---|---|
+| Fields | `tenant_id`, `camera_model`, `brand`, `doc_id`, `version`, `source_type` |
+| Comparison | `eq`, `ne`, `in` |
+| Logical | `AND`, `OR` |
+| Grouping | parentheses |
+
+Unsupported operators such as `regex` or `like` are rejected.
+
+## Parsing Flow
+
+```text
+Raw URL/body filter
+        |
+        v
+Tokenizer
+        |
+        v
+OR / AND / parentheses parser
+        |
+        v
+Field allowlist check
+        |
+        v
+Operator allowlist check
+        |
+        v
+Value safety check
+        |
+        v
+ValidatedMetadataFilter
+        |
+        v
+Spring AI Filter.Expression
+        |
+        v
+Qdrant SearchRequest
+```
+
+The parser never passes the original string to Qdrant.
+
+## Value Validation
+
+Values must contain between 1 and 128 characters from:
+
+```text
+letters, digits, underscore, dot, colon, slash, at-sign,
+hyphen, and spaces
+```
+
+The implementation rejects examples such as:
+
+```text
+brand:eq:'Sony; DROP TABLE users--'
+password_hash:eq:secret
+brand:regex:.*Sony.*
+```
+
+The SQL-like text is not a real SQL injection in this project, but it demonstrates that semicolons and punctuation are rejected instead of reaching the vector database.
+
+## AND and OR Precedence
+
+The parser gives `AND` precedence over `OR`. Conceptually:
+
+```text
+brand:eq:Sony OR brand:eq:Canon AND version:eq:2.0
+```
+
+is interpreted as:
+
+```text
+brand:eq:Sony OR (brand:eq:Canon AND version:eq:2.0)
+```
+
+Use parentheses when the intended grouping is important.
+
+## Automatic Tenant and Model Guardrails
+
+Every custom filter is combined with the trusted base filter:
+
+```text
+(tenant_id = tenantId)
+AND (camera_model = cameraModel, if supplied)
+AND (custom validated expression)
+```
+
+Consequently, a user cannot use `tenant_id:ne:<another tenant>` to bypass isolation. The custom expression is added to the base expression rather than replacing it.
+
+## Endpoint Examples
+
+GET request:
+
+```powershell
+$uri = "http://localhost/api/v1/assistant/ask" +
+       "?question=How+do+I+enable+Eye+AF" +
+       "&tenantId=studio-brasov" +
+       "&filter=brand:eq:Sony"
+
+Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $token" }
+```
+
+POST request:
+
+```json
+{
+  "question": "How do I enable Eye AF?",
+  "cameraModel": "Sony A7 IV",
+  "tenantId": "studio-brasov",
+  "filter": "brand:eq:Sony AND version:in:(1.0,2.0)"
+}
+```
+
+The POST controller prioritizes the `filter` query parameter when both URL and body filters are supplied.
+
+## Null and Blank Filter
+
+A null or blank filter means "no custom expression". The assistant uses the normal tenant/model guardrail:
+
+```text
+tenant_id = tenantId
+camera_model = cameraModel
+```
+
+It does not disable tenant isolation.
+
+## HTTP 400 Response
+
+An invalid field produces:
+
 ```json
 {
   "timestamp": "2026-11-25T12:00:00Z",
@@ -28,11 +173,33 @@ Adds a strict, AST-backed metadata filter parser (`SafeMetadataFilterParser`) to
   "error": "Invalid Metadata Filter",
   "message": "Metadata field 'unknown_field' is not allowed",
   "invalidToken": "unknown_field",
-  "validFields": ["tenant_id", "camera_model", "brand", "doc_id", "version", "source_type"],
-  "validOperators": ["eq", "ne", "in", "AND", "OR"]
+  "validFields": [
+    "tenant_id",
+    "camera_model",
+    "brand",
+    "doc_id",
+    "version",
+    "source_type"
+  ],
+  "validOperators": [
+    "eq",
+    "ne",
+    "in",
+    "AND",
+    "OR"
+  ]
 }
+```
 
+The response is generated by `MetadataFilterExceptionHandler`. Invalid input should therefore be explained to the client instead of appearing as an internal server error.
 
-## 4. Postman Collection
+## Tests
 
-A ready-to-import Postman v2.1 collection covering single filters, compound AND/OR/IN queries, null-filter fallthrough, and 400 Bad Request negative tests is committed at:postman/story3-task1-safe-metadata-filtering.postman_collection.json
+`SafeMetadataFilteringTask1Test` verifies:
+
+- compound filters compile to a Spring AI expression;
+- null and blank filters fall back normally;
+- unknown fields are rejected;
+- unsafe values are rejected before any VectorStore call;
+- a valid GET filter reaches the vector store;
+- an invalid GET filter returns HTTP 400 and the valid-field list.

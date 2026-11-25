@@ -30,9 +30,7 @@ public class SecurityConfig {
         http
             .csrf(ServerHttpSecurity.CsrfSpec::disable)
             .authorizeExchange(exchanges -> exchanges
-                // Doar ROLE_COMPLIANCE_OFFICER sau ROLE_ADMIN pot incarca manuale noi
                 .pathMatchers(HttpMethod.POST, "/api/v1/ingestion/upload").hasAnyAuthority("ROLE_COMPLIANCE_OFFICER", "ROLE_ADMIN")
-                // Orice alta cerere necesita un token JWT valid
                 .anyExchange().authenticated()
             )
             .oauth2ResourceServer(oauth2 -> oauth2

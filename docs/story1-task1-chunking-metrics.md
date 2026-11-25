@@ -1,44 +1,145 @@
-# Story 1 – Task 1: PDF Ingestion & Chunking Parameter Evaluation
+# Story 1: Structure-Aware PDF Ingestion and Chunking
 
-## 1. Objective
-Evaluate the impact of *structure-aware* chunking parameters (`chunk-size`, `chunk-overlap`, `parent-chunk-size`, `min-chunk-size-chars`) on text extraction quality from camera instruction manuals (including pages with technical specification tables and multi-column layouts), boundary context retention, and embedding generation cost (`nomic-embed-text`, 768 dimensions).
+## What This Feature Does
 
----
+Before RAG can answer a question, a camera manual must be converted into searchable text. `DocumentIngestionService` performs this process:
 
-## 2. Configurable Parameters (`application.yml`)
+1. validate the uploaded format;
+2. calculate a SHA-256 checksum;
+3. extract text page by page;
+4. clean extraction artifacts;
+5. create parent and child chunks;
+6. generate embeddings;
+7. store chunks and metadata in Qdrant;
+8. update the PostgreSQL ingestion status.
 
-| Parameter | Environment Variable | Default Value | Technical Role |
-| :--- | :--- | :---: | :--- |
-| `app.ingestion.chunk-size` | `APP_CHUNK_SIZE` | `250` (tokens) | Target size of the *Child Chunk* indexed as a vector in Qdrant |
-| `app.ingestion.chunk-overlap` | `APP_CHUNK_OVERLAP` | `50` (tokens / 20%) | Token overlap between consecutive chunks for semantic continuity |
-| `app.ingestion.parent-chunk-size` | `APP_PARENT_CHUNK_SIZE` | `1000` (tokens) | Size of the *Parent Chunk* passed to the LLM for rich context assembly |
-| `app.ingestion.min-chunk-size-chars` | `APP_MIN_CHUNK_SIZE_CHARS` | `80` (characters) | Minimum length threshold; shorter trailing fragments are merged with the previous chunk |
-| `app.ingestion.embedding-model` | `APP_EMBEDDING_MODEL` | `nomic-embed-text` | Ollama embedding model identifier (recorded in chunk metadata) |
-| `app.ingestion.batch-size` | `APP_INGESTION_BATCH_SIZE` | `20` (chunks/batch) | Batch size sent to Qdrant/Ollama to control CPU and memory load |
+## PDF Extraction
 
----
+For PDF files, Apache PDFBox is used. `PDFTextStripper.setSortByPosition(true)` asks PDFBox to return text in reading order. This is important for technical tables and multi-column pages: without sorting, text from two columns can be interleaved incorrectly.
 
-## 3. Comparative Benchmark Results (Multi-Page Camera Manual with Tables & Multi-Column Layout)
+Example conceptual output:
 
-Tests were executed via `ChunkingBenchmarkTest` using Apache PDFBox (`setSortByPosition(true)`) and `StructureAwareChunker` (prioritizing natural split boundaries: `\n\n` -> `\n` -> `. ! ?` -> whitespace):
+```text
+Page 16
+Shutter Speed
+P: 2 seconds to 1/700 seconds
+A: 2 seconds to 1/700 seconds
+M: Bulb or 4 seconds to 1/700 seconds
+```
 
-| Tested Configuration | Total Chunks | Avg. Length (chars) | Boundary Retention (Overlap) | Table Row Integrity | CPU Parse Time | Qualitative Observations |
-| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **1. Fine-Grained (No Overlap)** (`120t / 0t`, parent `600t`) | 12 | ~395 | 0.0% | Partial (risk of splitting wide rows) | ~18 ms | High pinpoint precision, but loses continuity across consecutive steps |
-| **2. Fine-Grained + Overlap** (`120t / 30t`, parent `600t`) | 16 | ~380 | ~87.5% | Yes (100%) | ~21 ms | Good for exact lookups, but increases vector count and Ollama latency by +33% |
-| **3. Balanced (No Overlap)** (`250t / 0t`, parent `1000t`) | 8 | ~640 | 0.0% | Yes (100%) | ~16 ms | Table rows remain intact, but trailing section sentences become isolated |
-| **4. Balanced Recommended** (`250t / 50t`, parent `1000t`) | **8** | **~690** | **~85.0%** | **Yes (100%)** | **~17 ms** | **Optimal:** keeps tables intact and provides 20% overlap without vector inflation |
-| **5. High-Overlap Dense** (`250t / 80t`, parent `1200t`) | 10 | ~670 | ~92.0% | Yes (100%) | ~19 ms | High redundancy (~32% overlap); increases storage/compute cost by ~25% with negligible recall gain |
-| **6. Coarse Context** (`500t / 75t`, parent `1500t`) | 4 | ~1380 | ~75.0% | Yes (100%) | ~14 ms | Mixes multiple sub-sections into a single vector, diluting cosine similarity |
+PDF extraction is page-aware. The page number is stored in metadata, so a generated citation can refer to the exact source page.
 
----
+For DOCX and TXT files, Spring AI's Apache Tika reader extracts text. A stable synthetic page number is assigned because these formats do not contain PDF page boundaries.
 
-## 4. Conclusions & Production Recommendations
+## Parent and Child Chunks
 
-1. **Optimal `chunk-overlap / chunk-size` ratio is `20%` (`50` tokens at `250` tokens):**
-   * Prevents context loss across chunk boundaries (e.g., exposure warnings or notes immediately following a specification table).
-   * Keeps the total vector count—and local Ollama embedding runtime—virtually identical to the zero-overlap baseline.
-2. **Impact of `min-chunk-size-chars = 80`:**
-   * Eliminates short "orphan" chunks (such as standalone page numbers or trailing subheadings) that would otherwise trigger false-positive similarity matches.
-3. **Impact of `setSortByPosition(true)` in Apache PDFBox:**
-   * Essential for technical camera manuals containing shutter-speed/aperture tables and two-column layouts, ensuring text is extracted in proper reading order rather than interleaving left and right columns.
+The project uses a parent-child strategy:
+
+- a **parent chunk** is a larger context section;
+- a **child chunk** is a smaller section embedded in Qdrant;
+- `parent_id` links a child to its parent;
+- `parent_content` contains the text sent to the language model.
+
+Example:
+
+```text
+Parent 1
+  Section on autofocus
+  + Eye AF setup steps
+  + Menu navigation
+  + Troubleshooting
+
+Child 1-A
+  "Enable Eye AF in Menu > AF1..."
+
+Child 1-B
+  "Assign AF-ON to activate Eye AF..."
+```
+
+Vector similarity searches the children for precision. The service then expands the selected child to its parent context, avoiding a search based only on a tiny fragment.
+
+## Configurable Parameters
+
+| Parameter | Default | Purpose |
+|---|---:|---|
+| `app.ingestion.chunk-size` | 250 tokens | approximate size of an indexed child |
+| `app.ingestion.chunk-overlap` | 50 tokens | text repeated between consecutive chunks |
+| `app.ingestion.parent-chunk-size` | 1000 tokens | approximate size of context sent to the model |
+| `app.ingestion.min-chunk-size-chars` | 80 characters | merges/removes very small trailing fragments |
+| `app.ingestion.embedding-model` | `nomic-embed-text` | model used for embeddings |
+| `app.ingestion.batch-size` | 20 chunks | number of vectors sent per indexing batch |
+
+Environment variables can replace the defaults:
+
+```powershell
+$env:APP_CHUNK_SIZE="250"
+$env:APP_CHUNK_OVERLAP="50"
+$env:APP_PARENT_CHUNK_SIZE="1000"
+$env:APP_EMBEDDING_MODEL="nomic-embed-text"
+```
+
+Internally, the chunker approximately converts tokens to characters using four characters per token. It searches for natural boundaries in this priority:
+
+```text
+paragraph break
+    -> new line
+    -> sentence ending
+    -> space between words
+    -> hard character limit
+```
+
+This is better than blindly cutting every 1000 characters because a cut can divide a menu step or table row.
+
+## Chunk Metadata
+
+Each Qdrant document contains values such as:
+
+| Field | Example |
+|---|---|
+| `doc_id` | `studio-brasov_fujifilm-ga645_fujifilm-ga645-zi-manual-pdf` |
+| `checksum` | SHA-256 of the source file |
+| `tenant_id` | `studio-brasov` |
+| `camera_model` | `Fujifilm GA645` |
+| `brand` | `Fujifilm` |
+| `file_name` | `fujifilm-ga645-zi-manual.pdf` |
+| `page_number` | `16` |
+| `parent_id` | page and parent index |
+| `parent_content` | complete surrounding section |
+| `embedding_model` | `nomic-embed-text` |
+
+Metadata is both searchable data and source information. It prevents cross-tenant retrieval and enables page citations.
+
+## Benchmark Profiles
+
+`ChunkingBenchmarkTest` creates a synthetic four-page PDF containing a table and runs six configurations. The generated table is not a universal production benchmark, but it demonstrates the trade-offs that should be discussed.
+
+| Profile | Child size | Overlap | Parent size | Main trade-off |
+|---|---:|---:|---:|---|
+| Fine | 120 | 0 | 600 | precise, less context |
+| Fine with overlap | 120 | 30 | 600 | stronger boundary continuity |
+| Balanced no overlap | 250 | 0 | 1000 | less redundancy |
+| Balanced recommended | 250 | 50 | 1000 | 20% overlap with complete context |
+| Dense overlap | 250 | 80 | 1200 | high redundancy |
+| Coarse | 500 | 75 | 1500 | fewer chunks but broader semantic mixing |
+
+The project defaults to 250/50/1000/80 because this profile is a practical balance:
+
+- chunks are large enough to contain a complete section;
+- overlap reduces loss at boundaries;
+- parent content supplies enough context for an answer;
+- the vector count remains manageable.
+
+Results may vary with the structure and quality of a real PDF. The benchmark is primarily evidence of parameter reasoning, not a claim that the same numbers will generalize to every document.
+
+## Idempotency and Status
+
+The ingestion endpoint calculates `SHA-256` for the uploaded bytes. If the same checksum has already completed for the same tenant and camera model, the controller skips re-ingestion.
+
+The `ManualDocument` record stores:
+
+```text
+PROCESSING -> COMPLETED
+           -> FAILED
+```
+
+This lets the API report whether a manual is still being processed or whether extraction failed.

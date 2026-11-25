@@ -1,68 +1,170 @@
-# Story 2 – Task 1: Dynamic Internet Ingestion
+# Story 2: Dynamic Internet Ingestion
 
-## 1. Overview
-Extends `ingestion-service` with an HTTP/HTTPS batch ingestion pipeline (`POST /api/v1/ingestion/internet`) capable of fetching, cleaning, chunking, and indexing external photography documentation into Qdrant while enforcing source attribution and fault tolerance.
+## Purpose
 
----
+`POST /api/v1/ingestion/internet` lets the ingestion service download and index sources that are not uploaded as local files. The implementation is in `DynamicInternetIngestionService`.
 
-## 2. Supported Source Types
+Every source is associated with the supplied tenant, camera model, brand, and version. HTTP and HTTPS are the only accepted URL schemes.
 
-| Source Type | Processing Pipeline | Key Behavior |
-| :--- | :--- | :--- |
-| **`WEB_PAGE`** | `HttpClient` -> `HtmlBoilerplateCleaner` (Jsoup) -> `StructureAwareChunker` | Strips `<nav>`, `<header>`, `<footer>`, `<aside>`, `<script>`, `<style>`, and cookie/GDPR/popup banners before extracting main article content (`<article>`, `<main>`, `[role=main]`). |
-| **`REMOTE_PDF`** | `HttpClient` -> `DocumentIngestionService.parseAndChunk` (Apache PDFBox) | Validates `%PDF` magic bytes in memory, extracts page-by-page text (`setSortByPosition(true)`), and enriches chunks with internet metadata. |
-| **`GITHUB_REPO`** | GitHub Trees API -> `raw.githubusercontent.com` -> `StructureAwareChunker` | Resolves default/target branch, discovers `.md`, `.txt`, and `.rst` documentation files (up to `max-repo-files`), and indexes each file with repo path metadata. |
+## Supported Sources
 
----
+| Source type | Processing |
+|---|---|
+| `WEB_PAGE` | fetch HTML, remove boilerplate, chunk article text |
+| `REMOTE_PDF` | fetch bytes, validate the `%PDF` header, use PDF chunking |
+| `GITHUB_REPO` | query the GitHub API, find documentation files, fetch them from `raw.githubusercontent.com` |
 
-## 3. Metadata Schema & Fault Tolerance
+## Web Page Processing
 
-- **Mandatory Internet Metadata (`Story 2 – Task 1`):** Every indexed chunk stores `source_url` (exact fetched URL) and `fetch_date` (ISO-8601 UTC timestamp), alongside the base metadata schema (`doc_id`, `version`, `source`, `page`, `chunk_index`, `checksum`, `tenant_id`, `camera_model`, `brand`).
-- **Batch Resilience:** Each source in a `DynamicBatchRequest` is processed independently. If a single URL fails (e.g., `HTTP 404`, timeout, invalid PDF header, or empty content), the error is logged and recorded as `FAILED` in the response without aborting the remaining items in the batch.
+`HtmlBoilerplateCleaner` uses Jsoup:
 
----
+1. remove `<nav>`, `<header>`, `<footer>`, `<aside>`, `<script>`, `<style>`, and cookie/GDPR elements;
+2. prefer `<article>`, `<main>`, or `[role=main]`;
+3. fall back to the body;
+4. extract headings and paragraphs;
+5. remove empty or repeated fragments.
 
-## 4. Configuration (`application.yml`)
+Example input:
 
-| Property | Environment Variable | Default | Description |
-| :--- | :--- | :---: | :--- |
-| `app.dynamic-ingestion.connect-timeout-ms` | `APP_DYNAMIC_CONNECT_TIMEOUT_MS` | `10000` | TCP connection timeout for outbound HTTP requests |
-| `app.dynamic-ingestion.read-timeout-ms` | `APP_DYNAMIC_READ_TIMEOUT_MS` | `15000` | Response read timeout per remote resource |
-| `app.dynamic-ingestion.max-repo-files` | `APP_DYNAMIC_MAX_REPO_FILES` | `15` | Maximum documentation files indexed per GitHub repository |
-| `app.dynamic-ingestion.user-agent` | — | `PhotoPulse-IngestionBot/1.0` | User-Agent header sent to remote servers and GitHub API |
+```html
+<header>Menu and advertising</header>
+<main>
+  <article>
+    <h1>Real-Time Eye AF</h1>
+    <p>Set Focus Mode to AF-C and Focus Area to Tracking.</p>
+  </article>
+</main>
+<footer>Privacy Policy</footer>
+```
 
----
+The chunk should contain the Eye AF paragraph, not the menu or privacy text.
 
-## 5. API Usage Example (PowerShell)
+## Remote PDF Processing
+
+The implementation downloads the remote bytes and validates the first four bytes:
+
+```text
+%PDF
+```
+
+It then reuses `DocumentIngestionService.parseAndChunk`, preserving PDF page extraction and parent-child chunk metadata.
+
+## GitHub Repository Processing
+
+For a GitHub URL, the service:
+
+1. extracts owner and repository;
+2. reads `/git/trees/{branch}?recursive=1`;
+3. optionally filters to a `/tree/{branch}/{path}` subdirectory;
+4. keeps `.md`, `.txt`, and `.rst` files;
+5. indexes at most `max-repo-files`;
+6. skips individual unreadable files.
+
+Example:
+
+```text
+https://github.com/example/camera-docs/tree/main/docs
+```
+
+The implementation scans the `docs` prefix and fetches matching documentation files.
+
+## Internet Metadata
+
+All indexed chunks contain attribution fields:
+
+| Field | Meaning |
+|---|---|
+| `source_url` | exact fetched URL or raw file URL |
+| `fetch_date` | ISO-8601 UTC fetch timestamp |
+| `source_type` | `web_page`, `remote_pdf`, or `github_repo` |
+| `repo_url` | source GitHub repository URL, for repository files |
+| `repo_file_path` | repository path such as `docs/fujifilm-recipes.md` |
+
+This allows a teacher or administrator to explain where an answer came from and when the source was retrieved.
+
+## Batch Fault Tolerance
+
+Each source has an independent `try/catch` in `ingestBatch`. For example:
+
+```text
+Source 1: success
+Source 2: HTTP 404
+Source 3: success
+```
+
+The result is:
+
+```json
+{
+  "totalSources": 3,
+  "succeeded": 2,
+  "failed": 1
+}
+```
+
+Source 2 is marked `FAILED`; sources 1 and 3 are still indexed. This is better than allowing one broken link to abort the complete request.
+
+## Configuration
+
+| Property | Default | Purpose |
+|---|---:|---|
+| `app.dynamic-ingestion.connect-timeout-ms` | 10000 ms | connection timeout |
+| `app.dynamic-ingestion.read-timeout-ms` | 15000 ms | response timeout |
+| `app.dynamic-ingestion.max-repo-files` | 15 | maximum documentation files per repository |
+| `app.dynamic-ingestion.user-agent` | `PhotoPulse-IngestionBot/1.0` | outbound identification |
+
+Environment variable equivalents:
 
 ```powershell
-\$internetBody = @{
-    tenantId = "studio-brasov"
-    version  = "1.0"
-    sources  = @(
-        @{
-            type        = "WEB_PAGE"
-            url         = "[https://example.com/guides/autofocus-tips](https://example.com/guides/autofocus-tips)"
-            cameraModel = "Sony A7 IV"
-            brand       = "Sony"
-        },
-        @{
-            type        = "REMOTE_PDF"
-            url         = "[https://example.com/manuals/quick-guide.pdf](https://example.com/manuals/quick-guide.pdf)"
-            cameraModel = "Canon EOS R6"
-            brand       = "Canon"
-        },
-        @{
-            type        = "GITHUB_REPO"
-            url         = "[https://github.com/open-photo/camera-profiles](https://github.com/open-photo/camera-profiles)"
-            cameraModel = "Fujifilm X-T5"
-            brand       = "Fujifilm"
-        }
-    )
-} | ConvertTo-Json -Depth 4
+$env:APP_DYNAMIC_CONNECT_TIMEOUT_MS="10000"
+$env:APP_DYNAMIC_READ_TIMEOUT_MS="15000"
+$env:APP_DYNAMIC_MAX_REPO_FILES="15"
+```
 
-Invoke-RestMethod -Uri "http://localhost/api/v1/ingestion/internet" `
+## PowerShell Example
+
+```powershell
+$internetBody = @{
+  tenantId = "studio-brasov"
+  version  = "1.0"
+  sources  = @(
+    @{
+      type        = "WEB_PAGE"
+      url         = "https://example.com/guides/autofocus-tips"
+      cameraModel = "Sony A7 IV"
+      brand       = "Sony"
+    },
+    @{
+      type        = "REMOTE_PDF"
+      url         = "https://example.com/manuals/quick-guide.pdf"
+      cameraModel = "Canon EOS R6"
+      brand       = "Canon"
+    },
+    @{
+      type        = "GITHUB_REPO"
+      url         = "https://github.com/open-photo/camera-profiles"
+      cameraModel = "Fujifilm X-T5"
+      brand       = "Fujifilm"
+    }
+  )
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod `
+  -Uri "http://localhost/api/v1/ingestion/internet" `
   -Method Post `
-  -Headers @{ Authorization = "Bearer \$token" } `
+  -Headers @{ Authorization = "Bearer $token" } `
   -ContentType "application/json" `
-  -Body \$internetBody | ConvertTo-Json -Depth 5
+  -Body $internetBody |
+  ConvertTo-Json -Depth 5
+```
+
+## Tests
+
+`InternetIngestionTask1Test` verifies:
+
+- Jsoup removes scripts, navigation, ads, and cookie banners;
+- web-page chunks contain `source_url` and `fetch_date`;
+- remote PDF files are recognized and parsed;
+- GitHub Markdown and text files are indexed;
+- one failed source does not stop valid sources;
+- an empty source list is rejected by request validation.
