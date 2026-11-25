@@ -3,6 +3,8 @@ package com.photopulse.assistant.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.photopulse.assistant.dto.AssistantDtos.*;
+import com.photopulse.assistant.filter.SafeMetadataFilterParser;
+import com.photopulse.assistant.filter.ValidatedMetadataFilter;
 import com.photopulse.assistant.model.AuditLog;
 import com.photopulse.assistant.repository.AuditLogRepository;
 import lombok.extern.slf4j.Slf4j;
@@ -14,6 +16,7 @@ import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -29,15 +32,19 @@ public class CameraAssistantService {
     private final AuditLogRepository auditLogRepository;
     private final MultiQueryExpander queryExpander;
     private final ObjectMapper objectMapper;
+    private final SafeMetadataFilterParser filterParser;
 
+    @Autowired
     public CameraAssistantService(ChatClient.Builder chatClientBuilder,
                                   VectorStore vectorStore,
                                   AuditLogRepository auditLogRepository,
-                                  ObjectMapper objectMapper) {
+                                  ObjectMapper objectMapper,
+                                  SafeMetadataFilterParser filterParser) {
         this.chatClient = chatClientBuilder.build();
         this.vectorStore = vectorStore;
         this.auditLogRepository = auditLogRepository;
         this.objectMapper = objectMapper;
+        this.filterParser = filterParser;
         this.queryExpander = MultiQueryExpander.builder()
                 .chatClientBuilder(chatClientBuilder)
                 .numberOfQueries(3)
@@ -45,17 +52,27 @@ public class CameraAssistantService {
                 .build();
     }
 
+    public CameraAssistantService(ChatClient.Builder chatClientBuilder,
+                                  VectorStore vectorStore,
+                                  AuditLogRepository auditLogRepository,
+                                  ObjectMapper objectMapper) {
+        this(chatClientBuilder, vectorStore, auditLogRepository, objectMapper, new SafeMetadataFilterParser());
+    }
+
     public AskResponse askQuestion(AskRequest request) {
         String tenantId = request.resolvedTenantId();
-        log.info("Processing RAG query for tenant '{}', camera '{}': {}", tenantId, request.cameraModel(), request.question());
+        log.info("Processing RAG query for tenant '{}', camera '{}', filter '{}': {}",
+                tenantId, request.cameraModel(), request.filter(), request.question());
+
+        // 0. Validare stricta a filtrului din URL/request INAINTE de orice apel spre VectorStore
+        ValidatedMetadataFilter customFilter = filterParser.parse(request.filter());
+        Filter.Expression filterExpression = buildCombinedFilter(tenantId, request.cameraModel(), customFilter);
 
         // 1. Pre-Retrieval: Multi-Query Expansion (3 variations + original)
         List<Query> expandedQueries = queryExpander.expand(new Query(request.question()));
         List<String> queryTexts = expandedQueries.stream().map(Query::text).toList();
 
-        // 2. Retrieval: Hybrid Metadata Guardrails (tenant isolation + optional camera model)
-        Filter.Expression filterExpression = buildTenantFilter(tenantId, request.cameraModel());
-
+        // 2. Retrieval: Hybrid Metadata Guardrails (tenant isolation + optional camera model + validated custom filter)
         Map<String, Document> uniqueParentChunks = new LinkedHashMap<>();
         List<CitationDto> citations = new ArrayList<>();
 
@@ -73,7 +90,6 @@ public class CameraAssistantService {
                 Map<String, Object> meta = childDoc.getMetadata();
                 String parentId = String.valueOf(meta.getOrDefault("parent_id", childDoc.getId()));
 
-                // Deduplicam dupa parent_id pentru a nu trimite acelasi paragraf mare de mai multe ori
                 if (!uniqueParentChunks.containsKey(parentId)) {
                     uniqueParentChunks.put(parentId, childDoc);
 
@@ -102,13 +118,13 @@ public class CameraAssistantService {
                 .map(doc -> {
                     Map<String, Object> meta = doc.getMetadata();
                     String parentText = String.valueOf(meta.getOrDefault("parent_content", doc.getText()));
-                    return String.format("\n%s",
+                    return String.format("[Manual: %s | Camera: %s | Page: %s]\n%s",
                             meta.getOrDefault("file_name", "Manual"),
                             meta.getOrDefault("camera_model", "Camera"),
                             meta.getOrDefault("page_number", "?"),
                             parentText);
                 })
-                .limit(5) // Limitam la top 5 parent chunks pentru viteza optima pe CPU
+                .limit(5)
                 .collect(Collectors.joining("\n\n---\n\n"));
 
         // 4. Generation + Topic Boundary & Anti-Hallucination Guardrails
@@ -118,7 +134,7 @@ public class CameraAssistantService {
                 STRICT RULES:
                 1. TOPIC BOUNDARY: If the user's question is NOT related to photography, cameras, lenses, or camera settings, refuse politely and state that you only assist with photography equipment manuals.
                 2. GROUNDING: Answer ONLY using the provided CONTEXT from the camera manuals. Do NOT guess or invent camera specs or menu paths.
-                3. CITATIONS: Always cite the source manual name and page number (e.g.,) for every technical instruction you provide.
+                3. CITATIONS: Always cite the source manual name and page number for every technical instruction you provide.
                 4. MISSING INFO: If the provided context does not contain the answer, explicitly say: "I could not find this information in the uploaded camera manuals for your organization."
                 5. LANGUAGE: Respond in the same language the user asked the question in (e.g., Romanian or English).
                 """;
@@ -129,7 +145,7 @@ public class CameraAssistantService {
 
                 USER QUESTION:
                 %s
-                """, assembledContext.isBlank() ? "NO MATCHING DOCUMENTS FOUND." : assembledContext, request.question());
+                """, assembledContext, request.question());
 
         String aiAnswer = chatClient.prompt()
                 .system(systemPrompt)
@@ -147,9 +163,8 @@ public class CameraAssistantService {
         String tenantId = request.resolvedTenantId();
         log.info("Running Gap Analysis for camera '{}' in tenant '{}'", request.cameraModel(), tenantId);
 
-        Filter.Expression filterExpression = buildTenantFilter(tenantId, request.cameraModel());
+        Filter.Expression filterExpression = buildCombinedFilter(tenantId, request.cameraModel(), null);
 
-        // Impartim checklist-ul/cerintele pe linii si cautam acoperirea in manualul camerei
         String[] requirements = request.targetChecklist().split("\\r?\\n");
         Set<String> seenParents = new HashSet<>();
         StringBuilder gatheredSpecs = new StringBuilder();
@@ -214,15 +229,16 @@ public class CameraAssistantService {
         return new AskResponse(savedLog.getId(), report, List.of(request.targetChecklist()), citations);
     }
 
-    private Filter.Expression buildTenantFilter(String tenantId, String cameraModel) {
+    public Filter.Expression buildCombinedFilter(String tenantId, String cameraModel, ValidatedMetadataFilter customFilter) {
         FilterExpressionBuilder b = new FilterExpressionBuilder();
-        if (cameraModel != null && !cameraModel.isBlank()) {
-            return b.and(
-                    b.eq("tenant_id", tenantId),
-                    b.eq("camera_model", cameraModel.trim())
-            ).build();
+        FilterExpressionBuilder.Op baseOp = (cameraModel != null && !cameraModel.isBlank())
+                ? b.and(b.eq("tenant_id", tenantId), b.eq("camera_model", cameraModel.trim()))
+                : b.eq("tenant_id", tenantId);
+
+        if (customFilter == null) {
+            return baseOp.build();
         }
-        return b.eq("tenant_id", tenantId).build();
+        return b.and(baseOp, customFilter.toOp(b)).build();
     }
 
     private AuditLog saveAuditLog(String tenantId, String cameraModel, String query,
