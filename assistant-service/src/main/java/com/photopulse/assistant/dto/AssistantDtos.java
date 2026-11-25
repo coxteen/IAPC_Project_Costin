@@ -29,12 +29,28 @@ public class AssistantDtos {
             String snippet
     ) {}
 
+    public record RerankMetadataDto(
+            boolean reranked,
+            String modelVersion,
+            long latencyMs,
+            int candidatesEvaluated,
+            int returnedCount
+    ) {}
+
     public record AskResponse(
             UUID auditId,
             String answer,
             List<String> expandedQueries,
-            List<CitationDto> citations
-    ) {}
+            List<CitationDto> citations,
+            RerankMetadataDto rerankInfo
+    ) {
+        public AskResponse(UUID auditId,
+                           String answer,
+                           List<String> expandedQueries,
+                           List<CitationDto> citations) {
+            this(auditId, answer, expandedQueries, citations, null);
+        }
+    }
 
     public record GapAnalysisRequest(
             @NotBlank(message = "Target requirements or comparison checklist must not be empty")

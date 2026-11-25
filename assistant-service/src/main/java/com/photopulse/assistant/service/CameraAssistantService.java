@@ -7,6 +7,9 @@ import com.photopulse.assistant.filter.SafeMetadataFilterParser;
 import com.photopulse.assistant.filter.ValidatedMetadataFilter;
 import com.photopulse.assistant.model.AuditLog;
 import com.photopulse.assistant.repository.AuditLogRepository;
+import com.photopulse.assistant.rerank.CrossEncoderReranker;
+import com.photopulse.assistant.rerank.RerankResult;
+import com.photopulse.assistant.rerank.RerankerProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.document.Document;
@@ -33,18 +36,24 @@ public class CameraAssistantService {
     private final MultiQueryExpander queryExpander;
     private final ObjectMapper objectMapper;
     private final SafeMetadataFilterParser filterParser;
+    private final CrossEncoderReranker reranker;
+    private final RerankerProperties rerankerProperties;
 
     @Autowired
     public CameraAssistantService(ChatClient.Builder chatClientBuilder,
                                   VectorStore vectorStore,
                                   AuditLogRepository auditLogRepository,
                                   ObjectMapper objectMapper,
-                                  SafeMetadataFilterParser filterParser) {
+                                  SafeMetadataFilterParser filterParser,
+                                  CrossEncoderReranker reranker,
+                                  RerankerProperties rerankerProperties) {
         this.chatClient = chatClientBuilder.build();
         this.vectorStore = vectorStore;
         this.auditLogRepository = auditLogRepository;
         this.objectMapper = objectMapper;
         this.filterParser = filterParser;
+        this.reranker = reranker;
+        this.rerankerProperties = rerankerProperties;
         this.queryExpander = MultiQueryExpander.builder()
                 .chatClientBuilder(chatClientBuilder)
                 .numberOfQueries(3)
@@ -55,8 +64,34 @@ public class CameraAssistantService {
     public CameraAssistantService(ChatClient.Builder chatClientBuilder,
                                   VectorStore vectorStore,
                                   AuditLogRepository auditLogRepository,
+                                  ObjectMapper objectMapper,
+                                  SafeMetadataFilterParser filterParser) {
+        this(
+                chatClientBuilder,
+                vectorStore,
+                auditLogRepository,
+                objectMapper,
+                filterParser,
+                disabledFallbackReranker(objectMapper),
+                disabledRerankerProperties()
+        );
+    }
+
+    public CameraAssistantService(ChatClient.Builder chatClientBuilder,
+                                  VectorStore vectorStore,
+                                  AuditLogRepository auditLogRepository,
                                   ObjectMapper objectMapper) {
         this(chatClientBuilder, vectorStore, auditLogRepository, objectMapper, new SafeMetadataFilterParser());
+    }
+
+    private static RerankerProperties disabledRerankerProperties() {
+        RerankerProperties props = new RerankerProperties();
+        props.setEnabled(false);
+        return props;
+    }
+
+    private static CrossEncoderReranker disabledFallbackReranker(ObjectMapper objectMapper) {
+        return new CrossEncoderReranker(disabledRerankerProperties(), objectMapper);
     }
 
     public AskResponse askQuestion(AskRequest request) {
@@ -72,14 +107,14 @@ public class CameraAssistantService {
         List<Query> expandedQueries = queryExpander.expand(new Query(request.question()));
         List<String> queryTexts = expandedQueries.stream().map(Query::text).toList();
 
-        // 2. Retrieval: Hybrid Metadata Guardrails (tenant isolation + optional camera model + validated custom filter)
+        // 2. Stage-1 Retrieval: colectam un set mai larg de candidati (top-N, ex: 20)
+        int candidateTopN = Math.max(1, rerankerProperties.getTopN());
         Map<String, Document> uniqueParentChunks = new LinkedHashMap<>();
-        List<CitationDto> citations = new ArrayList<>();
 
         for (Query q : expandedQueries) {
             SearchRequest searchRequest = SearchRequest.builder()
                     .query(q.text())
-                    .topK(4)
+                    .topK(candidateTopN)
                     .similarityThreshold(0.35)
                     .filterExpression(filterExpression)
                     .build();
@@ -90,17 +125,8 @@ public class CameraAssistantService {
                 Map<String, Object> meta = childDoc.getMetadata();
                 String parentId = String.valueOf(meta.getOrDefault("parent_id", childDoc.getId()));
 
-                if (!uniqueParentChunks.containsKey(parentId)) {
+                if (!uniqueParentChunks.containsKey(parentId) && uniqueParentChunks.size() < candidateTopN) {
                     uniqueParentChunks.put(parentId, childDoc);
-
-                    String fileName = String.valueOf(meta.getOrDefault("file_name", "Unknown Manual"));
-                    String camModel = String.valueOf(meta.getOrDefault("camera_model", "Unknown Camera"));
-                    Integer pageNum = meta.get("page_number") instanceof Number n ? n.intValue() : 1;
-                    String snippet = childDoc.getText() != null
-                            ? childDoc.getText().substring(0, Math.min(200, childDoc.getText().length())).replace("\n", " ") + "..."
-                            : "";
-
-                    citations.add(new CitationDto(fileName, camModel, pageNum, snippet));
                 }
             }
         }
@@ -110,11 +136,31 @@ public class CameraAssistantService {
             String noDocsMsg = "I could not find any matching information in the uploaded camera manuals for tenant '"
                     + tenantId + "'" + (request.cameraModel() != null ? " and model '" + request.cameraModel() + "'." : ".");
             AuditLog savedLog = saveAuditLog(tenantId, request.cameraModel(), request.question(), noDocsMsg, List.of());
-            return new AskResponse(savedLog.getId(), noDocsMsg, queryTexts, List.of());
+            RerankMetadataDto emptyRerank = new RerankMetadataDto(
+                    false, rerankerProperties.getModelVersion(), 0L, 0, 0
+            );
+            return new AskResponse(savedLog.getId(), noDocsMsg, queryTexts, List.of(), emptyRerank);
         }
 
-        // 3. Context Assembly (folosim parent_content pentru context complet)
-        String assembledContext = uniqueParentChunks.values().stream()
+        // 3. Stage-2 Post-Retrieval: Cross-Encoder Reranking (top-N -> top-k) cu fallback la ordinea initiala
+        List<Document> candidateList = new ArrayList<>(uniqueParentChunks.values());
+        RerankResult rerankResult = reranker.rerank(request.question(), candidateList);
+        List<Document> finalDocs = rerankResult.documents();
+
+        List<CitationDto> citations = finalDocs.stream()
+                .map(this::toCitationDto)
+                .toList();
+
+        RerankMetadataDto rerankMetadata = new RerankMetadataDto(
+                rerankResult.reranked(),
+                rerankResult.modelVersion(),
+                rerankResult.latencyMs(),
+                candidateList.size(),
+                finalDocs.size()
+        );
+
+        // 4. Context Assembly (folosim parent_content pentru context complet din top-k reranked)
+        String assembledContext = finalDocs.stream()
                 .map(doc -> {
                     Map<String, Object> meta = doc.getMetadata();
                     String parentText = String.valueOf(meta.getOrDefault("parent_content", doc.getText()));
@@ -124,10 +170,9 @@ public class CameraAssistantService {
                             meta.getOrDefault("page_number", "?"),
                             parentText);
                 })
-                .limit(5)
                 .collect(Collectors.joining("\n\n---\n\n"));
 
-        // 4. Generation + Topic Boundary & Anti-Hallucination Guardrails
+        // 5. Generation + Topic Boundary & Anti-Hallucination Guardrails
         String systemPrompt = """
                 You are PhotoPulse AI, a strict technical assistant specialized EXCLUSIVELY in cameras, lenses, photography equipment, and camera instruction manuals.
                 
@@ -153,10 +198,10 @@ public class CameraAssistantService {
                 .call()
                 .content();
 
-        // 5. Audit Trail Persistence
+        // 6. Audit Trail Persistence
         AuditLog savedLog = saveAuditLog(tenantId, request.cameraModel(), request.question(), aiAnswer, citations);
 
-        return new AskResponse(savedLog.getId(), aiAnswer, queryTexts, citations);
+        return new AskResponse(savedLog.getId(), aiAnswer, queryTexts, citations, rerankMetadata);
     }
 
     public AskResponse performGapAnalysis(GapAnalysisRequest request) {
@@ -239,6 +284,17 @@ public class CameraAssistantService {
             return baseOp.build();
         }
         return b.and(baseOp, customFilter.toOp(b)).build();
+    }
+
+    private CitationDto toCitationDto(Document doc) {
+        Map<String, Object> meta = doc.getMetadata();
+        String fileName = String.valueOf(meta.getOrDefault("file_name", "Unknown Manual"));
+        String camModel = String.valueOf(meta.getOrDefault("camera_model", "Unknown Camera"));
+        Integer pageNum = meta.get("page_number") instanceof Number n ? n.intValue() : 1;
+        String snippet = doc.getText() != null
+                ? doc.getText().substring(0, Math.min(200, doc.getText().length())).replace("\n", " ") + "..."
+                : "";
+        return new CitationDto(fileName, camModel, pageNum, snippet);
     }
 
     private AuditLog saveAuditLog(String tenantId, String cameraModel, String query,

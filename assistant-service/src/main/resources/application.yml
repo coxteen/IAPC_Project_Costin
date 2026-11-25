@@ -32,6 +32,15 @@ spring:
         port: 6334
         collection-name: camera_manuals
         initialize-schema: false # Collection is already created by ingestion service
+    
+    app:
+      reranker:
+        enabled: ${APP_RERANKER_ENABLED:true}
+        top-n: ${APP_RERANK_TOP_N:20}
+        top-k: ${APP_RERANK_TOP_K:5}
+        model-version: ${APP_RERANKER_MODEL_VERSION:BAAI/bge-reranker-v2-m3@rev-2025.10}
+        endpoint-url: ${APP_RERANKER_URL:http://localhost:11434/api/rerank}
+        timeout-ms: ${APP_RERANKER_TIMEOUT_MS:3000}
 
 eureka:
   client:
