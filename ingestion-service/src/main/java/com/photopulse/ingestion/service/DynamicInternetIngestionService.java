@@ -66,8 +66,7 @@ public class DynamicInternetIngestionService {
         );
     }
 
-    // Constructor package-private pentru injectarea unui HttpClient mockuit in teste
-    DynamicInternetIngestionService(VectorStore vectorStore,
+    public DynamicInternetIngestionService(VectorStore vectorStore,
                                     ManualDocumentRepository documentRepository,
                                     DocumentIngestionService staticIngestionService,
                                     StructureAwareChunker chunker,
