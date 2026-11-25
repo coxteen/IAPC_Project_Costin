@@ -10,8 +10,13 @@ public class AssistantDtos {
             @NotBlank(message = "Question must not be empty")
             String question,
             String cameraModel,
-            String tenantId
+            String tenantId,
+            String filter
     ) {
+        public AskRequest(String question, String cameraModel, String tenantId) {
+            this(question, cameraModel, tenantId, null);
+        }
+
         public String resolvedTenantId() {
             return (tenantId == null || tenantId.isBlank()) ? "default-tenant" : tenantId.trim();
         }

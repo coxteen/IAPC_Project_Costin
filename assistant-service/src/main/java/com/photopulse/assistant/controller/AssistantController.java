@@ -29,9 +29,27 @@ public class AssistantController {
         return ResponseEntity.ok(assistantService.performGapAnalysis(request));
     }
 
-    @GetMapping("/audit-logs")
-    public ResponseEntity<List<AuditLog>> getAuditLogs(
-            @RequestParam(value = "tenantId", defaultValue = "default-tenant") String tenantId) {
-        return ResponseEntity.ok(auditLogRepository.findByTenantIdOrderByCreatedAtDesc(tenantId));
+   @PostMapping("/ask")
+    public ResponseEntity<AskResponse> ask(
+            @RequestParam(value = "filter", required = false) String urlFilter,
+            @Valid @RequestBody AskRequest request) {
+        String effectiveFilter = (urlFilter != null && !urlFilter.isBlank()) ? urlFilter : request.filter();
+        AskRequest resolvedRequest = new AskRequest(
+                request.question(),
+                request.cameraModel(),
+                request.tenantId(),
+                effectiveFilter
+        );
+        return ResponseEntity.ok(assistantService.askQuestion(resolvedRequest));
+    }
+
+    @GetMapping("/ask")
+    public ResponseEntity<AskResponse> askByQueryParams(
+            @RequestParam("question") String question,
+            @RequestParam(value = "cameraModel", required = false) String cameraModel,
+            @RequestParam(value = "tenantId", required = false) String tenantId,
+            @RequestParam(value = "filter", required = false) String filter) {
+        AskRequest request = new AskRequest(question, cameraModel, tenantId, filter);
+        return ResponseEntity.ok(assistantService.askQuestion(request));
     }
 }
